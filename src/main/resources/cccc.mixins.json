@@ -6,6 +6,9 @@
   "mixins": [
     "GrapplingHookEntityMixin"
   ],
+  "client": [
+    "GrapplingHookRendererMixin"
+  ],
   "injectors": {
     "defaultRequire": 1
   }

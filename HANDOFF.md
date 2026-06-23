@@ -1,7 +1,7 @@
 # CCCC – Handoff Notes
 
 **Mod:** Create x Critters & Companions Compat (`cccc`)  
-**Status:** Create contraptions attach/pull and have a new interpolation fix for smoother rendering. Sable sub-levels use a new untested fallback that discards the physical hook before Sable movement and applies pull from player tick state.  
+**Status:** Create contraptions attach/pull and now include a client renderer correction for smoother hook-end rendering. Sable sub-levels use a new untested fallback that discards the physical hook before Sable movement and applies pull from player tick state.  
 **Author:** R2bEEaton  
 
 ---
@@ -44,6 +44,8 @@ Create notes: the hook attaches, the player is pulled, and the hook follows the 
 
 Latest Create face-selection fix: sometimes the hook still clipped through the intended face and latched to a bottom/side face on first throw. The Create attach scan now sweeps the hook AABB from previous tick position to current tick position, scores overlapping blocks by swept hit time, and chooses the entry face from previous→current local motion. Nearest-face snapping is only a fallback when no motion/entry face can be inferred.
 
+Latest Create render fix: tick-position interpolation still left small jitter on rotating contraptions because vanilla entity rendering lerps a straight line between previous/current hook positions, while Create renders blocks with partial-tick rotation. `GrapplingHookEntityMixin` now exposes an exact partial-tick Create hook position through `CreateHookRenderAttachment`, using an interpolated contraption anchor plus `AbstractContraptionEntity.applyRotation(local, partialTicks)`. Client-only `GrapplingHookRendererMixin` shifts C&C's hook render pose to that exact partial position and redirects the hook-end string coordinate lerps so the line endpoint uses the same position.
+
 For Sable, the real hook entity cannot remain in or near the sub-level without stopping the swivel. The current fallback predicts a Sable hit at hook tick HEAD, records a local-space surface anchor, discards the real hook, cancels that hook tick, then applies the C&C-style pull from `PlayerTickEvent.Post`.
 
 ---
@@ -74,6 +76,10 @@ Files changed:
 - `src/main/java/cc/spea/cccc/mixin/GrapplingHookEntityMixin.java`
   - Sable detection can now happen at tick HEAD and cancel before projectile movement.
   - Sable redirect path now delegates to the fallback instead of pinning the real hook.
+- `src/main/java/cc/spea/cccc/mixin/GrapplingHookRendererMixin.java`
+  - Client-only C&C renderer adjustment for exact Create partial-tick hook end rendering.
+- `src/main/java/cc/spea/cccc/compat/CreateHookRenderAttachment.java`
+  - Small interface used by the renderer mixin to ask the hook entity for its exact partial-tick Create attach position.
 - `src/main/java/cc/spea/cccc/compat/SableCompat.java`
   - Still handles Sable reflection and sub-level local/world transforms.
 - `src/main/java/cc/spea/cccc/compat/SableGrappleHandler.java`
@@ -179,6 +185,7 @@ The `AbstractContraptionEntity` path is working but still needs in-game verifica
 - Face choice now prefers the swept entry face from the hook's previous-to-current motion, reducing cases where a fast hook clips through and attaches to a bottom/side face.
 - Create detection now runs on both server and client; Sable fallback remains server-only.
 - Position tracked each tick via `toGlobalVector(localAttach, 1f)` for current position and `toGlobalVector(localAttach, 0f, true)` for previous render position (`xo/yo/zo` and `xOld/yOld/zOld`).
+- Renderer correction: `GrapplingHookRendererMixin` translates C&C's hook render pose to `CreateHookRenderAttachment.cccc$getCreateHookRenderPosition(partialTicks)` and redirects the hook string endpoint's hook-position lerps to use that exact partial position.
 - Player is pulled smoothly toward the moving/rotating contraption block.
 
 ---

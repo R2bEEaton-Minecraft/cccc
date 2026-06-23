@@ -1,11 +1,13 @@
 package cc.spea.cccc.mixin;
 
 import cc.spea.cccc.CCCC;
+import cc.spea.cccc.compat.CreateHookRenderAttachment;
 import cc.spea.cccc.compat.SableCompat;
 import cc.spea.cccc.compat.SableGrappleHandler;
 import com.github.eterdelta.crittersandcompanions.entity.GrapplingHookEntity;
 import com.simibubi.create.content.contraptions.AbstractContraptionEntity;
 import net.minecraft.core.BlockPos;
+import net.minecraft.util.Mth;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.EntityType;
 import net.minecraft.world.entity.player.Player;
@@ -62,7 +64,7 @@ import java.util.List;
  * @author R2bEEaton
  */
 @Mixin(GrapplingHookEntity.class)
-public abstract class GrapplingHookEntityMixin extends ThrowableItemProjectile {
+public abstract class GrapplingHookEntityMixin extends ThrowableItemProjectile implements CreateHookRenderAttachment {
 
     // ── Shadowed C&C field ───────────────────────────────────────────────────
     // Verified: javap -classpath critters-and-companions-*.jar -p
@@ -196,6 +198,26 @@ public abstract class GrapplingHookEntityMixin extends ThrowableItemProjectile {
             }
 
         }
+    }
+
+    @Override
+    @Nullable
+    public Vec3 cccc$getCreateHookRenderPosition(float partialTicks) {
+        if (cccc_contraption == null || cccc_localAttach == null || !cccc_contraption.isAlive()) return null;
+
+        Vec3 previousAnchor = cccc_contraption.getPrevAnchorVec();
+        Vec3 currentAnchor = cccc_contraption.getAnchorVec();
+        Vec3 anchor = new Vec3(
+            Mth.lerp(partialTicks, previousAnchor.x, currentAnchor.x),
+            Mth.lerp(partialTicks, previousAnchor.y, currentAnchor.y),
+            Mth.lerp(partialTicks, previousAnchor.z, currentAnchor.z)
+        );
+
+        Vec3 rotationOffset = Vec3.atCenterOf(BlockPos.ZERO);
+        return cccc_contraption
+            .applyRotation(cccc_localAttach.subtract(rotationOffset), partialTicks)
+            .add(rotationOffset)
+            .add(anchor);
     }
 
     @Unique

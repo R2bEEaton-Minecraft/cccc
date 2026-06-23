@@ -5,6 +5,7 @@ import cc.spea.cccc.compat.CreateHookRenderAttachment;
 import cc.spea.cccc.compat.SableCompat;
 import cc.spea.cccc.compat.SableGrappleHandler;
 import com.github.eterdelta.crittersandcompanions.entity.GrapplingHookEntity;
+import com.github.eterdelta.crittersandcompanions.platform.Services;
 import com.simibubi.create.content.contraptions.AbstractContraptionEntity;
 import net.minecraft.core.BlockPos;
 import net.minecraft.util.Mth;
@@ -34,8 +35,8 @@ import java.util.List;
  *
  * Handles two distinct moving-block systems:
  *   • Create contraptions  (pin the real hook entity to contraption-local space)
- *   • Sable sub-levels     (discard the real hook before Sable can collide with
- *                           it, then pull via SableGrappleHandler)
+ *   • Sable sub-levels     (pin the real hook as a visual marker, then pull via
+ *                           SableGrappleHandler)
  *
  * ── Why the hook bounces ─────────────────────────────────────────────────────
  * GrapplingHookEntity.tick() (bytecode ~103) calls
@@ -53,7 +54,7 @@ import java.util.List;
  *
  * @Inject tick HEAD:
  *   • For Sable, predict a sub-level hit before projectile movement, register a
- *     local-space anchor, discard the physical hook, and cancel the hook tick.
+ *     local-space anchor, and cancel the hook's own physics while attached.
  *   • For Create, push the hook to the contraption's current world transform
  *     every tick so it follows bearings, pistons, etc.
  *
@@ -70,10 +71,17 @@ public abstract class GrapplingHookEntityMixin extends ThrowableItemProjectile i
     // Verified: javap -classpath critters-and-companions-*.jar -p
     //   com.github.eterdelta.crittersandcompanions.entity.GrapplingHookEntity
     @Shadow(remap = false) protected boolean isStick;
+    @Shadow(remap = false) public abstract void updateOwnerState();
 
     // ── Create contraption attachment ─────────────────────────────────────────
     @Unique @Nullable private AbstractContraptionEntity cccc_contraption;
     @Unique @Nullable private Vec3                      cccc_localAttach;
+
+    // ── Sable visual attachment ──────────────────────────────────────────────
+    @Unique @Nullable private Object cccc_sableSubLevel;
+    @Unique @Nullable private Vec3   cccc_sableLocalAttach;
+
+    @Unique private static final int CCCC_SABLE_OWNER_FOOT_GRACE_TICKS = 6;
 
     protected GrapplingHookEntityMixin(EntityType<? extends ThrowableItemProjectile> type, Level level) {
         super(type, level);
@@ -86,6 +94,15 @@ public abstract class GrapplingHookEntityMixin extends ThrowableItemProjectile i
     // from its attach point, eliminating the jerk-every-tick artefact.
     @Inject(method = "tick", at = @At("HEAD"), cancellable = true)
     private void cccc_tickHead(CallbackInfo ci) {
+        if (cccc_sableSubLevel != null) {
+            if (!cccc_pinToSableAttach()) {
+                cccc_clearSableAttach();
+                this.discard();
+            }
+            ci.cancel();
+            return;
+        }
+
         if (cccc_tryStartSableFallback()) {
             ci.cancel();
             return;
@@ -139,13 +156,55 @@ public abstract class GrapplingHookEntityMixin extends ThrowableItemProjectile i
         }
 
         // ── Detect first entry: Sable sub-level ───────────────────────────────
-        SableCompat.Hit hit = level.isClientSide ? null : SableCompat.findHitAt(level, hookPos, hookAABB);
+        SableCompat.Hit hit = SableCompat.findHitAt(level, previousHookPos, hookPos, sweptHookAABB);
         if (hit != null) {
-            cccc_startSableFallback(hit);
-            return real;
+            if (cccc_shouldIgnoreOwnerFootSableHit(hit)) {
+                return real;
+            }
+
+            if (level.isClientSide) {
+                cccc_startSableVisual(hit);
+                return cccc_fakeSolid();
+            } else {
+                cccc_startSableFallback(hit);
+                return real;
+            }
         }
 
         return real;
+    }
+
+    @Inject(method = "pull", at = @At("HEAD"), cancellable = true)
+    private void cccc_pullSableHook(CallbackInfo ci) {
+        if (cccc_sableSubLevel == null) return;
+
+        if (this.getOwner() instanceof Player player) {
+            Vec3 target = cccc_sableLocalAttach == null ? null : SableCompat.toWorldPos(cccc_sableSubLevel, cccc_sableLocalAttach);
+            if (target != null) {
+                Vec3 direction = target.subtract(player.position()).normalize();
+                double reelSpeed = Services.CONFIGS.common().grapplingHookSpeed.get() / 4.0;
+                double maxSpeed = Services.CONFIGS.common().grapplingHookMaxSpeed.get();
+                double speed = Math.min(maxSpeed, reelSpeed * Math.sqrt(player.position().distanceToSqr(target)));
+                player.setDeltaMovement(direction.scale(speed));
+                player.hurtMarked = true;
+            }
+
+            if (!this.level().isClientSide) {
+                SableGrappleHandler.detach(player);
+            }
+        }
+
+        cccc_clearSableAttach();
+        this.discard();
+        ci.cancel();
+    }
+
+    @Inject(method = "remove", at = @At("HEAD"))
+    private void cccc_removeSableHook(Entity.RemovalReason reason, CallbackInfo ci) {
+        if (cccc_sableSubLevel != null && this.getOwner() instanceof Player player && !this.level().isClientSide) {
+            SableGrappleHandler.detach(player);
+        }
+        cccc_clearSableAttach();
     }
 
     // ── 3. Entity-hit fallback ───────────────────────────────────────────────
@@ -174,8 +233,8 @@ public abstract class GrapplingHookEntityMixin extends ThrowableItemProjectile i
      *
      * For Create contraptions we convert the stored local attach point back to
      * world space, then zero velocity + disable gravity so super.tick() cannot
-     * drift the hook.  Sable uses SableGrappleHandler instead of this real-entity
-     * pinning path.
+     * drift the hook.  Sable uses cccc_pinToSableAttach() because its anchor is
+     * transformed through SableCompat reflection.
      */
     @Unique
     private void cccc_pinToAttach() {
@@ -203,6 +262,10 @@ public abstract class GrapplingHookEntityMixin extends ThrowableItemProjectile i
     @Override
     @Nullable
     public Vec3 cccc$getCreateHookRenderPosition(float partialTicks) {
+        if (cccc_sableSubLevel != null && cccc_sableLocalAttach != null) {
+            return SableCompat.toRenderWorldPos(cccc_sableSubLevel, cccc_sableLocalAttach, partialTicks);
+        }
+
         if (cccc_contraption == null || cccc_localAttach == null || !cccc_contraption.isAlive()) return null;
 
         Vec3 previousAnchor = cccc_contraption.getPrevAnchorVec();
@@ -225,24 +288,86 @@ public abstract class GrapplingHookEntityMixin extends ThrowableItemProjectile i
         if (this.level().isClientSide || cccc_contraption != null) return false;
         if (!(this.getOwner() instanceof Player)) return false;
 
+        Vec3 hookPos = this.position();
+        Vec3 predictedHookPos = hookPos.add(this.getDeltaMovement());
         AABB swept = this.getBoundingBox()
             .minmax(this.getBoundingBox().move(this.getDeltaMovement()))
             .inflate(0.25);
-        Vec3 predictedHookPos = this.position().add(this.getDeltaMovement());
-        SableCompat.Hit hit = SableCompat.findHitAt(this.level(), predictedHookPos, swept);
-        return hit != null && cccc_startSableFallback(hit);
+        SableCompat.Hit hit = SableCompat.findHitAt(this.level(), hookPos, predictedHookPos, swept);
+        return hit != null && !cccc_shouldIgnoreOwnerFootSableHit(hit) && cccc_startSableFallback(hit);
     }
 
     @Unique
     private boolean cccc_startSableFallback(SableCompat.Hit hit) {
         if (!(this.getOwner() instanceof Player player)) return false;
 
+        cccc_startSableVisual(hit);
         SableGrappleHandler.attach((GrapplingHookEntity) (Object) this, player, hit.subLevel(), hit.localAttach());
-        this.setDeltaMovement(Vec3.ZERO);
-        this.isStick = false;
-        this.discard();
+        this.updateOwnerState();
         CCCC.LOGGER.debug("[cccc] Hook #{} → Sable sub-level fallback pull (surface local {})", getId(), hit.localAttach());
         return true;
+    }
+
+    @Unique
+    private void cccc_startSableVisual(SableCompat.Hit hit) {
+        cccc_sableSubLevel = hit.subLevel();
+        cccc_sableLocalAttach = hit.localAttach();
+        this.setDeltaMovement(Vec3.ZERO);
+        this.isStick = false;
+        this.setNoGravity(true);
+        this.noPhysics = true;
+        cccc_pinToSableAttach();
+    }
+
+    @Unique
+    private boolean cccc_shouldIgnoreOwnerFootSableHit(SableCompat.Hit hit) {
+        if (this.tickCount > CCCC_SABLE_OWNER_FOOT_GRACE_TICKS) return false;
+        if (!(this.getOwner() instanceof Player player)) return false;
+
+        Vec3 worldAttach = SableCompat.toWorldPos(hit.subLevel(), hit.localAttach());
+        if (worldAttach == null) return false;
+
+        AABB feetZone = player.getBoundingBox()
+            .inflate(0.75, 0.15, 0.75)
+            .expandTowards(0.0, -1.25, 0.0);
+
+        if (!feetZone.contains(worldAttach)) return false;
+
+        CCCC.LOGGER.debug("[cccc] Ignoring near-owner Sable hook hit at {}", worldAttach);
+        return true;
+    }
+
+    @Unique
+    private boolean cccc_pinToSableAttach() {
+        if (cccc_sableSubLevel == null || cccc_sableLocalAttach == null) return false;
+        if (SableCompat.isRemoved(cccc_sableSubLevel)) return false;
+        if (!this.level().isClientSide
+            && (!(this.getOwner() instanceof Player player) || !SableGrappleHandler.isAttached(player))) {
+            return false;
+        }
+
+        Vec3 world = SableCompat.toWorldPos(cccc_sableSubLevel, cccc_sableLocalAttach);
+        if (world == null) return false;
+
+        this.xo = this.getX();
+        this.yo = this.getY();
+        this.zo = this.getZ();
+        this.xOld = this.getX();
+        this.yOld = this.getY();
+        this.zOld = this.getZ();
+        this.setPos(world.x, world.y, world.z);
+        this.setDeltaMovement(Vec3.ZERO);
+        this.setNoGravity(true);
+        this.noPhysics = true;
+        return true;
+    }
+
+    @Unique
+    private void cccc_clearSableAttach() {
+        cccc_sableSubLevel = null;
+        cccc_sableLocalAttach = null;
+        this.noPhysics = false;
+        this.setNoGravity(false);
     }
 
     @Unique

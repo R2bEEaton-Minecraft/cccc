@@ -1,7 +1,7 @@
 # CCCC – Handoff Notes
 
 **Mod:** Create x Critters & Companions Compat (`cccc`)  
-**Status:** Create contraptions attach/pull and now include a client renderer correction for smoother hook-end rendering. Sable sub-levels use a new untested fallback that discards the physical hook before Sable movement and applies pull from player tick state.  
+**Status:** Create contraptions attach/pull and now include a client renderer correction for smoother hook-end rendering. Sable sub-levels use a fallback that discards the physical hook before Sable movement and applies pull from player tick state; latest pass is tuning hit detection because hooks were bouncing off without starting the fallback.
 **Author:** R2bEEaton  
 
 ---
@@ -46,6 +46,8 @@ Latest Create face-selection fix: sometimes the hook still clipped through the i
 
 Latest Create render fix: tick-position interpolation still left small jitter on rotating contraptions because vanilla entity rendering lerps a straight line between previous/current hook positions, while Create renders blocks with partial-tick rotation. `GrapplingHookEntityMixin` now exposes an exact partial-tick Create hook position through `CreateHookRenderAttachment`, using an interpolated contraption anchor plus `AbstractContraptionEntity.applyRotation(local, partialTicks)`. Client-only `GrapplingHookRendererMixin` shifts C&C's hook render pose to that exact partial position and redirects the hook-end string coordinate lerps so the line endpoint uses the same position.
 
+Latest Sable detection fix: after Create was working, Sable hooks were back to visibly bouncing off with no `Hook #... → Sable sub-level fallback pull` debug log, so the fallback was not starting. `SableCompat.findHitAt(...)` now has a swept previous→current overload. The hook mixin passes swept AABBs to Sable from both tick HEAD and redirect paths. Sable scanning now checks all sublevels instead of relying on `queryIntersecting(...)`, transforms previous/current hook positions into local space, scores local plot blocks by swept hit time, and chooses the entry face for the stored local anchor.
+
 For Sable, the real hook entity cannot remain in or near the sub-level without stopping the swivel. The current fallback predicts a Sable hit at hook tick HEAD, records a local-space surface anchor, discards the real hook, cancels that hook tick, then applies the C&C-style pull from `PlayerTickEvent.Post`.
 
 ---
@@ -82,6 +84,7 @@ Files changed:
   - Small interface used by the renderer mixin to ask the hook entity for its exact partial-tick Create attach position.
 - `src/main/java/cc/spea/cccc/compat/SableCompat.java`
   - Still handles Sable reflection and sub-level local/world transforms.
+  - Latest: swept previous/current Sable hit test using direct `LevelPlot.getChunk(...)` block reads; no embedded accessor block-state calls.
 - `src/main/java/cc/spea/cccc/compat/SableGrappleHandler.java`
   - New player tick pull manager for Sable attachments.
 - `src/main/java/cc/spea/cccc/CCCC.java`
@@ -111,7 +114,8 @@ Current fix:
 
 - `SableCompat` now caches `LevelPlot.getBoundingBox()`, `BoundingBox3ic.contains(int, int, int)`, and `LevelPlot.getChunk(ChunkPos)`.
 - Sable block probes read from Sable's own `LevelChunk` via `LevelPlot.getChunk(localChunk)` and `LevelChunk.getBlockState(localBlock)`, returning air when the plot chunk is missing. They no longer call `EmbeddedPlotLevelAccessor.getBlockState(...)`, so the hit probe should not trigger backing-world chunk generation.
-- New `SableCompat.findHitAt(...)` transforms all 8 corners of the hook's swept/inflated world AABB into Sable local space, scans overlapping local plot blocks, and returns a local-space surface anchor for the nearest non-air block.
+- `SableCompat.findHitAt(...)` transforms all 8 corners of the hook's swept/inflated world AABB into Sable local space, scans overlapping local plot blocks, and returns a local-space surface anchor for the earliest swept non-air block hit.
+- The latest Sable path uses previous→current local motion to choose an entry face, mirroring the Create contraption face-selection fix.
 - `GrapplingHookEntityMixin` now starts the Sable fallback from that `Hit` result directly, instead of recomputing/snapping from the hook center.
 - `hasBlockAt()` now fails closed (`false`) when reflection/probing fails, instead of attaching anyway.
 

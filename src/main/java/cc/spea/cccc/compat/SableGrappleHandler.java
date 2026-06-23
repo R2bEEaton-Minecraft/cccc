@@ -14,10 +14,10 @@ import java.util.concurrent.ConcurrentHashMap;
 /**
  * Sable-only fallback pull system.
  *
- * A real grappling hook entity can freeze Sable sub-levels even with RETAIN and
- * noPhysics, so Sable attachments discard the physical hook and keep only a
- * local-space anchor.  This tick handler mirrors C&C's pull force against that
- * moving anchor without giving Sable an entity to collide with.
+ * A real grappling hook entity can freeze Sable sub-levels if it keeps running
+ * normal projectile collision, so Sable attachments keep the hook only as a
+ * pinned visual marker.  This tick handler mirrors C&C's pull force against the
+ * moving local-space anchor.
  */
 public final class SableGrappleHandler {
 
@@ -32,6 +32,14 @@ public final class SableGrappleHandler {
             owner.distanceToSqr(hook),
             hook.getItem().copy()
         ));
+    }
+
+    public static boolean isAttached(Player owner) {
+        return ACTIVE.containsKey(owner.getUUID());
+    }
+
+    public static void detach(Player owner) {
+        ACTIVE.remove(owner.getUUID());
     }
 
     public static void onPlayerTick(PlayerTickEvent.Post event) {

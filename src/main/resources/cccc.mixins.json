@@ -1,0 +1,12 @@
+{
+  "required": true,
+  "minVersion": "0.8",
+  "package": "cc.spea.cccc.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "mixins": [
+    "GrapplingHookEntityMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}

@@ -27,7 +27,16 @@ sourceSets.main.resources {
 }
 
 repositories {
-    // Add here additional repositories if required by some of the dependencies below.
+    // Create's own Maven — hosts com.simibubi.create:create-<mcver>
+    maven {
+        name = "Create Maven"
+        url = "https://maven.createmod.net"
+    }
+    // Modrinth Maven — maven.modrinth:<slug>:<version-id>
+    maven {
+        name = "Modrinth Maven"
+        url = "https://api.modrinth.com/maven"
+    }
 }
 
 base {
@@ -118,27 +127,39 @@ configurations {
 }
 
 dependencies {
-    // Example optional mod dependency with JEI
-    // The JEI API is declared for compile time use, while the full JEI artifact is used at runtime
-    // compileOnly "mezz.jei:jei-${mc_version}-common-api:${jei_version}"
-    // compileOnly "mezz.jei:jei-${mc_version}-neoforge-api:${jei_version}"
-    // We add the full version to localRuntime, not runtimeOnly, so that we do not publish a dependency on it
-    // localRuntime "mezz.jei:jei-${mc_version}-neoforge:${jei_version}"
+    // ── Create 6.0.10 ─────────────────────────────────────────────────────────
+    // Maven: https://maven.createmod.net  |  group: com.simibubi.create
+    // Using the full (non-slim) JAR so that NeoForge's JarInJar system extracts
+    // Create's bundled runtime deps: Flywheel, Ponder, Registrate, etc.
+    // The slim JAR strips those, which causes Create's own mixins to crash at
+    // load time when they reference Registrate classes.
+    // transitive=false still blocks Maven-declared optional deps (JEI, Curios…).
+    compileOnly("com.simibubi.create:create-1.21.1:${create_version}") { transitive = false }
+    localRuntime("com.simibubi.create:create-1.21.1:${create_version}") { transitive = false }
 
-    // Example mod dependency using a mod jar from ./libs with a flat dir repository
-    // This maps to ./libs/coolmod-${mc_version}-${coolmod_version}.jar
-    // The group id is ignored when searching -- in this case, it is "blank"
-    // implementation "blank:coolmod-${mc_version}:${coolmod_version}"
+    // ── Critters and Companions 1.21.1-2.3.4 ─────────────────────────────────
+    // Modrinth Maven  |  version-id: a8zCwdaO
+    compileOnly("maven.modrinth:critters-and-companions:${cnc_version}") { transitive = false }
+    localRuntime("maven.modrinth:critters-and-companions:${cnc_version}") { transitive = false }
 
-    // Example mod dependency using a file as dependency
-    // implementation files("libs/coolmod-${mc_version}-${coolmod_version}.jar")
+    // ── Create Aeronautics 1.2.1 ──────────────────────────────────────────────
+    // Modrinth Maven  |  version-id: YhZLrAFC
+    compileOnly("maven.modrinth:create-aeronautics:${create_aeronautics_version}") { transitive = false }
+    localRuntime("maven.modrinth:create-aeronautics:${create_aeronautics_version}") { transitive = false }
 
-    // Example project dependency using a sister or child project:
-    // implementation project(":myproject")
+    // ── Runtime-only transitive deps (not compiled against, not shipped) ──────
+    // Flywheel and Ponder are now JiJ'd inside the full Create JAR above.
+    // GeckoLib and Sable still need to be listed explicitly: C&C and the
+    // Aeronautics sub-mods (aeronautics, offroad, simulated) require them but
+    // neither bundled JAR JiJ's them.
 
-    // For more info:
-    // http://www.gradle.org/docs/current/userguide/artifact_dependencies_tutorial.html
-    // http://www.gradle.org/docs/current/userguide/dependency_management.html
+    // GeckoLib 4.9 — animation library required by Critters & Companions
+    localRuntime("maven.modrinth:geckolib:${geckolib_version}") { transitive = false }
+
+    // Sable 1.2.2 — physics sub-level engine required by Aeronautics sub-mods.
+    // localRuntime only: all Sable calls go through SableCompat (reflection) so
+    // the companion JarInJar types never appear as compile-time imports.
+    localRuntime("maven.modrinth:sable:${sable_version}") { transitive = false }
 }
 
 // This block of code expands all declared replace properties in the specified resource targets.

@@ -203,5 +203,5 @@ The `AbstractContraptionEntity` path is working but still needs in-game verifica
 | Create Aeronautics (bundled) | 1.2.1 | `maven.modrinth:create-aeronautics:YhZLrAFC` |
 | Sable | 1.2.2 | `maven.modrinth:sable:3FMsUjO4` |
 | GeckoLib | 4.9 | `maven.modrinth:geckolib:F3JBWthV` |
-| NeoForge | 21.1.234 | — |
+| NeoForge | 21.1.230 | — |
 | Minecraft | 1.21.1 | — |

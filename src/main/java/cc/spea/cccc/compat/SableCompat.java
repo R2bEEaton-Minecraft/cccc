@@ -3,37 +3,44 @@ package cc.spea.cccc.compat;
 import cc.spea.cccc.CCCC;
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.level.ChunkPos;
+import net.minecraft.world.level.EmptyBlockGetter;
 import net.minecraft.world.level.Level;
-import net.minecraft.world.level.chunk.LevelChunk;
+import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.Vec3;
+import net.minecraft.world.phys.shapes.CollisionContext;
+import net.minecraft.world.phys.shapes.VoxelShape;
 
 import javax.annotation.Nullable;
-import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
-import java.util.Collections;
-import java.util.IdentityHashMap;
-import java.util.Set;
-import java.util.function.BiFunction;
 
 /**
  * Sable sub-level integration via reflection.
  *
- * Why reflection?
- * Sable ships its companion library (BoundingBox3d, Pose3dc, etc.) as a
- * JarInJar inside the outer Sable JAR.  When the outer JAR is on the compile
- * classpath the JVM does not automatically expose the nested JAR's classes, so
- * direct imports would fail to compile.  Reflection lets us call the API at
- * runtime once Sable is actually loaded by NeoForge.
+ * ── Coordinate frames ─────────────────────────────────────────────────────────
  *
- * All method handles are cached on first use; a ClassNotFoundException on init
- * marks Sable as unavailable and every query returns null immediately.
+ * There are three frames in play:
  *
- * Coordinate mapping (from bytecode analysis of EmbeddedPlotLevelAccessor):
- *   getBlockState(pos) = level.getBlockState(pos.offset(center))
- * Pose3dc.transformPositionInverse produces the accessor's local block frame;
- * direct chunk reads must add the plot center before querying LevelChunk data.
+ *   1. Visible-world frame  – where the player and hook actually are in game.
+ *      This is what all Minecraft entity positions use.
+ *
+ *   2. Backing-level frame  – where Sable physically stores its blocks in the
+ *      real MC level (typically at large XZ coordinates like ±20 million).
+ *      Pose3dc.transformPositionInverse(visiblePos)  → backing pos.
+ *      Pose3dc.transformPosition(backingPos)         → visible pos.
+ *
+ *   3. Plot-local frame     – the coordinate system used by LevelPlot's own
+ *      chunk/block storage.
+ *      plot-local = backing − center
+ *      where center = LevelPlot.getCenterBlock() (a BlockPos in backing frame).
+ *      LevelPlot.getChunk(ChunkPos) and LevelChunk.getBlockState(BlockPos)
+ *      both use plot-local coordinates.
+ *
+ * All attach anchors stored in {@link Hit} are in PLOT-LOCAL frame.
+ * {@link #toWorldPos} and {@link #toRenderWorldPos} add center before
+ * calling transformPosition to convert back to visible-world frame.
  *
  * @author R2bEEaton
  */
@@ -43,34 +50,17 @@ public final class SableCompat {
     private static boolean available   = false;
 
     // ── Cached reflective handles ─────────────────────────────────────────────
-    private static Method       mGetContainer;       // SubLevelContainer.getContainer(Level)
-    private static Method       mGetAllSubLevels;    // SubLevelContainer.getAllSubLevels()
-    private static Method       mIsRemoved;          // SubLevel.isRemoved()
-    private static Method       mLogicalPose;        // SubLevel.logicalPose() → Pose3dc
-    private static Method       mRenderPose;         // ClientSubLevel.renderPose(float) → Pose3dc
-    private static Method       mTransformPosition;  // Pose3dc.transformPosition(Vec3) → Vec3
-    private static Method       mTransformInverse;   // Pose3dc.transformPositionInverse(Vec3) → Vec3
-    private static Method       mGetPlot;            // SubLevel.getPlot() → LevelPlot
-    private static Method       mGetPlotChunk;       // LevelPlot.getChunk(ChunkPos) → LevelChunk
-    private static Method       mGetPlotCenterBlock; // LevelPlot.getCenterBlock() → BlockPos
-    private static Method       mPlotToLocalChunk;   // LevelPlot.toLocal(ChunkPos) → ChunkPos
-    private static Method       mGetPlotBounds;      // LevelPlot.getBoundingBox() → BoundingBox3ic
-    private static Method       mBoundsContains;     // BoundingBox3ic.contains(int, int, int)
-    private static Constructor<?> ctorBB3d;          // BoundingBox3d(double × 6)
-    private static Method       mQueryIntersecting;  // SubLevelContainer.queryIntersecting(BoundingBox3dc)
-    private static Object       sableHelper;         // Sable.HELPER
-    private static Method       mRunIncludingSubLevels; // ActiveSableCompanion.runIncludingSubLevels(...)
-    private static Class<?>     clsBB3dc;            // interface BoundingBox3dc
-
-    private static final Vec3[] HELPER_SAMPLE_OFFSETS = {
-        new Vec3(0.0, 0.0, 0.0),
-        new Vec3(0.35, 0.0, 0.0),
-        new Vec3(-0.35, 0.0, 0.0),
-        new Vec3(0.0, 0.35, 0.0),
-        new Vec3(0.0, -0.35, 0.0),
-        new Vec3(0.0, 0.0, 0.35),
-        new Vec3(0.0, 0.0, -0.35)
-    };
+    private static Method mGetContainer;       // SubLevelContainer.getContainer(Level)
+    private static Method mGetAllSubLevels;   // SubLevelContainer.getAllSubLevels()
+    private static Method mIsRemoved;         // SubLevel.isRemoved()
+    private static Method mLogicalPose;       // SubLevel.logicalPose() → Pose3dc
+    private static Method mRenderPose;        // ClientSubLevel.renderPose(float) → Pose3dc
+    private static Method mTransformPosition; // Pose3dc.transformPosition(Vec3) → Vec3
+    private static Method mTransformInverse;  // Pose3dc.transformPositionInverse(Vec3) → Vec3
+    private static Method mGetPlot;           // SubLevel.getPlot() → LevelPlot
+    private static Method mGetPlotChunk;      // LevelPlot.getChunk(ChunkPos) → LevelChunk (takes LOCAL chunk pos)
+    private static Method mGetPlotCenter;     // LevelPlot.getCenterBlock() → BlockPos  (in BACKING frame)
+    private static Method mPlotToLocalChunk;  // LevelPlot.toLocal(ChunkPos) → ChunkPos (backing → local chunk)
 
     private SableCompat() {}
 
@@ -81,69 +71,61 @@ public final class SableCompat {
         return available;
     }
 
-    /**
-     * Returns the first Sable sub-level that has a non-air block at the hook's
-     * current position, or {@code null} if none is found or Sable is unavailable.
-     *
-     * Uses queryIntersecting for efficiency when companion classes are accessible
-     * (NeoForge JarInJar extraction makes them available at runtime even though
-     * Gradle can't see them at compile time).
-     */
     @Nullable
     public static Object findAt(Level level, Vec3 hookPos, AABB hookAABB) {
         Hit hit = findHitAt(level, hookPos, hookAABB);
         return hit == null ? null : hit.subLevel();
     }
 
-    /**
-     * Returns the first Sable sub-level whose local plot blocks overlap the
-     * hook AABB, plus a local-space surface anchor for the manual pull.
-     */
     @Nullable
     public static Hit findHitAt(Level level, Vec3 hookPos, AABB hookAABB) {
         return findHitAt(level, hookPos, hookPos, hookAABB);
     }
 
     /**
-     * Swept variant used by the hook mixin.  Sable can bounce the projectile
-     * before the hook center ever settles inside a local block, so using the
-     * previous→current motion gives us the entry face instead of a post-bounce
-     * final position.
+     * Swept variant used by the hook mixin.  All returned anchor positions are
+     * in plot-local frame.
      */
     @Nullable
     public static Hit findHitAt(Level level, Vec3 previousHookPos, Vec3 hookPos, AABB hookAABB) {
         if (!isAvailable()) return null;
         try {
-            Object container = mGetContainer.invoke(null, level);
-            Set<Object> broadHits = queryBroadHits(container, hookAABB.inflate(0.75));
+            Object container  = mGetContainer.invoke(null, level);
             Iterable<?> subLevels = (Iterable<?>) mGetAllSubLevels.invoke(container);
 
+            int slCount = 0;
             for (Object sl : subLevels) {
-                if (isRemoved(sl)) continue;
+                slCount++;
+                if (isRemoved(sl)) {
+                    CCCC.LOGGER.debug("[cccc] findHitAt: sub-level {} removed", slCount);
+                    continue;
+                }
 
-                // Convert hook world pos → sub-level local frame
-                Object pose  = mLogicalPose.invoke(sl);
-                Vec3   localPrevious = (Vec3) mTransformInverse.invoke(pose, previousHookPos);
-                Vec3   local = (Vec3) mTransformInverse.invoke(pose, hookPos);
-                AABB   localAabb = transformAabbInverse(pose, hookAABB);
+                Object pose   = mLogicalPose.invoke(sl);
+                Object plot   = mGetPlot.invoke(sl);
+                Vec3   center = plotCenter(plot);
 
-                Vec3 localAttach = findLocalAttachment(sl, localPrevious, local, localAabb.inflate(0.75));
+                // visible-world → backing frame
+                Vec3 backingPrev = (Vec3) mTransformInverse.invoke(pose, previousHookPos);
+                Vec3 backing     = (Vec3) mTransformInverse.invoke(pose, hookPos);
+                AABB backingAabb = transformAabbInverse(pose, hookAABB);
+
+                // backing → plot-local frame
+                Vec3 localPrev = backingPrev.subtract(center);
+                Vec3 local     = backing.subtract(center);
+                AABB localAabb = backingAabb.move(-center.x, -center.y, -center.z);
+
+                CCCC.LOGGER.debug("[cccc] findHitAt: sl{} localPrev={} local={} localAabb={}",
+                    slCount, localPrev, local, localAabb);
+
+                Vec3 localAttach = findLocalAttachment(plot, localPrev, local, localAabb.inflate(0.1));
+                CCCC.LOGGER.debug("[cccc] findHitAt: sl{} localAttach={}", slCount, localAttach);
                 if (localAttach != null) {
                     return new Hit(sl, localAttach);
                 }
-
-                if (broadHits.contains(sl)) {
-                    Vec3 broadAttach = findLocalAttachment(sl, localPrevious, local, localAabb.inflate(2.0), 4.0);
-                    if (broadAttach != null) {
-                        CCCC.LOGGER.debug("[cccc] Sable broadphase block fallback hit at local {}", broadAttach);
-                        return new Hit(sl, broadAttach);
-                    }
-                }
             }
-
-            Hit helperHit = findHelperAttachment(level, previousHookPos, hookPos);
-            if (helperHit != null) {
-                return helperHit;
+            if (slCount == 0) {
+                CCCC.LOGGER.debug("[cccc] findHitAt: no sub-levels in container");
             }
         } catch (Exception e) {
             CCCC.LOGGER.debug("[cccc] SableCompat.findHitAt error: {}", e.toString());
@@ -151,34 +133,77 @@ public final class SableCompat {
         return null;
     }
 
+    /**
+     * Returns the Sable sub-level nearest to {@code worldPos} (within 64 blocks
+     * of the plot-local origin), using the hook's position converted to plot-local
+     * space as the anchor.
+     *
+     * Primary attachment trigger: Sable registers its blocks through the real-world
+     * collision system, so C&C's own {@code isStick} fires on contact.  No block-data
+     * reads needed here — just pose transforms to find the right sub-level.
+     */
+    @Nullable
+    public static Hit findSubLevelNear(Level level, Vec3 worldPos) {
+        if (!isAvailable()) return null;
+        try {
+            Object      container = mGetContainer.invoke(null, level);
+            Iterable<?> subLevels = (Iterable<?>) mGetAllSubLevels.invoke(container);
+
+            Object bestSl    = null;
+            Vec3   bestLocal = null;
+            double bestDist  = 64.0;
+            int    total     = 0;
+
+            for (Object sl : subLevels) {
+                total++;
+                if (isRemoved(sl)) {
+                    CCCC.LOGGER.debug("[cccc] findSubLevelNear: sl{} removed", total);
+                    continue;
+                }
+
+                Object pose    = mLogicalPose.invoke(sl);
+                Object plot    = mGetPlot.invoke(sl);
+                Vec3   center  = plotCenter(plot);
+
+                // visible-world → plot-local
+                Vec3   backing  = (Vec3) mTransformInverse.invoke(pose, worldPos);
+                Vec3   local    = backing.subtract(center);
+                double dist     = local.length();
+
+                CCCC.LOGGER.debug("[cccc] findSubLevelNear: sl{} backing={} local={} dist={}",
+                    total, backing, local, dist);
+
+                if (dist < bestDist) {
+                    bestDist  = dist;
+                    bestSl    = sl;
+                    bestLocal = local;
+                }
+            }
+
+            CCCC.LOGGER.debug("[cccc] findSubLevelNear: scanned {} sl, best dist={}", total, bestDist);
+            return bestSl != null ? new Hit(bestSl, bestLocal) : null;
+        } catch (Exception e) {
+            CCCC.LOGGER.debug("[cccc] SableCompat.findSubLevelNear error: {}", e.toString());
+            return null;
+        }
+    }
+
     public record Hit(Object subLevel, Vec3 localAttach) {}
 
-    /**
-     * Returns true if the sub-level has a non-air block at {@code localPos}.
-     *
-     * Uses the same local coordinate frame as EmbeddedPlotLevelAccessor:
-     *   backingBlock = localBlockPos.offset(plotCenter)
-     */
     public static boolean hasBlockAt(Object subLevel, Vec3 localPos) {
-        return findLocalAttachment(subLevel, localPos, localPos, new AABB(localPos, localPos)) != null;
-    }
-
-    @Nullable
-    private static Vec3 findLocalAttachment(Object subLevel, Vec3 localPreviousPos, Vec3 localPos, AABB localAabb) {
-        return findLocalAttachment(subLevel, localPreviousPos, localPos, localAabb, Double.POSITIVE_INFINITY);
-    }
-
-    @Nullable
-    private static Vec3 findLocalAttachment(
-        Object subLevel,
-        Vec3 localPreviousPos,
-        Vec3 localPos,
-        AABB localAabb,
-        double maxAttachDistanceSqr
-    ) {
-        if (!isAvailable() || mGetPlot == null || mGetPlotChunk == null) return null;
         try {
             Object plot = mGetPlot.invoke(subLevel);
+            return findLocalAttachment(plot, localPos, localPos, new AABB(localPos, localPos)) != null;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    @Nullable
+    private static Vec3 findLocalAttachment(Object plot, Vec3 localPrev, Vec3 localPos, AABB localAabb) {
+        if (!isAvailable() || mGetPlot == null || mGetPlotChunk == null) return null;
+        try {
+            BlockPos center = (BlockPos) mGetPlotCenter.invoke(plot);
 
             final double EPS = 1.0E-6;
             int minX = (int) Math.floor(localAabb.minX - EPS);
@@ -188,31 +213,39 @@ public final class SableCompat {
             int maxY = (int) Math.floor(localAabb.maxY + EPS);
             int maxZ = (int) Math.floor(localAabb.maxZ + EPS);
 
-            Vec3 bestAttach = null;
-            double bestHitTime = Double.MAX_VALUE;
+            Vec3   bestAttach      = null;
+            double bestHitTime     = Double.MAX_VALUE;
             double bestDistanceSqr = Double.MAX_VALUE;
 
             for (int x = minX; x <= maxX; x++) {
                 for (int y = minY; y <= maxY; y++) {
                     for (int z = minZ; z <= maxZ; z++) {
-                        BlockPos block = new BlockPos(x, y, z);
-                        if (plotBlockState(plot, block).isAir()) continue;
+                        BlockPos   block = new BlockPos(x, y, z);
+                        BlockState state = plotBlockState(plot, center, block);
+                        if (state.isAir()) continue;
 
-                        double hitTime = sweptHitTime(localPreviousPos, localPos, block);
-                        Vec3 attach = pointOnBlockSurface(localPos, block, entryFace(localPreviousPos, localPos, block));
-                        double distanceSqr = attach.distanceToSqr(localPos);
-                        if (distanceSqr > maxAttachDistanceSqr) continue;
-                        if (hitTime < bestHitTime || (hitTime == bestHitTime && distanceSqr < bestDistanceSqr)) {
-                            bestHitTime = hitTime;
-                            bestDistanceSqr = distanceSqr;
-                            bestAttach = attach;
+                        VoxelShape shape = state.getCollisionShape(
+                            EmptyBlockGetter.INSTANCE, block, CollisionContext.empty());
+                        if (shape.isEmpty()) continue;
+                        AABB shapeBounds = shape.bounds().move(x, y, z);
+
+                        double hitTime = sweptHitTime(localPrev, localPos, shapeBounds);
+                        int    face    = entryFace(localPrev, localPos, shapeBounds);
+                        Vec3   attach  = pointOnBlockSurface(localPos, shapeBounds, face);
+                        double distSqr = attach.distanceToSqr(localPos);
+
+                        if (hitTime < bestHitTime
+                                || (hitTime == bestHitTime && distSqr < bestDistanceSqr)) {
+                            bestHitTime     = hitTime;
+                            bestDistanceSqr = distSqr;
+                            bestAttach      = attach;
                         }
                     }
                 }
             }
             return bestAttach;
         } catch (Exception e) {
-            CCCC.LOGGER.debug("[cccc] SableCompat.hasBlockAt error: {}", e.toString());
+            CCCC.LOGGER.debug("[cccc] SableCompat.findLocalAttachment error: {}", e.toString());
             return null;
         }
     }
@@ -228,292 +261,170 @@ public final class SableCompat {
             new Vec3(worldAabb.maxX, worldAabb.maxY, worldAabb.minZ),
             new Vec3(worldAabb.maxX, worldAabb.maxY, worldAabb.maxZ)
         };
-
         Vec3 first = (Vec3) mTransformInverse.invoke(pose, corners[0]);
         double minX = first.x, minY = first.y, minZ = first.z;
         double maxX = first.x, maxY = first.y, maxZ = first.z;
         for (int i = 1; i < corners.length; i++) {
             Vec3 local = (Vec3) mTransformInverse.invoke(pose, corners[i]);
-            minX = Math.min(minX, local.x);
-            minY = Math.min(minY, local.y);
-            minZ = Math.min(minZ, local.z);
-            maxX = Math.max(maxX, local.x);
-            maxY = Math.max(maxY, local.y);
-            maxZ = Math.max(maxZ, local.z);
+            minX = Math.min(minX, local.x); minY = Math.min(minY, local.y); minZ = Math.min(minZ, local.z);
+            maxX = Math.max(maxX, local.x); maxY = Math.max(maxY, local.y); maxZ = Math.max(maxZ, local.z);
         }
         return new AABB(minX, minY, minZ, maxX, maxY, maxZ);
     }
 
-    private static Vec3 pointOnBlockSurface(Vec3 point, BlockPos block, int face) {
-        double minX = block.getX();
-        double minY = block.getY();
-        double minZ = block.getZ();
-        double maxX = minX + 1.0;
-        double maxY = minY + 1.0;
-        double maxZ = minZ + 1.0;
-
-        double x = clamp(point.x, minX, maxX);
-        double y = clamp(point.y, minY, maxY);
-        double z = clamp(point.z, minZ, maxZ);
-
-        if (face == -1) {
-            face = nearestFace(point, block);
-        }
-
+    private static Vec3 pointOnBlockSurface(Vec3 point, AABB box, int face) {
+        double x = clamp(point.x, box.minX, box.maxX);
+        double y = clamp(point.y, box.minY, box.maxY);
+        double z = clamp(point.z, box.minZ, box.maxZ);
+        if (face == -1) face = nearestFace(point, box);
         switch (face) {
-            case 0 -> x = minX;
-            case 1 -> x = maxX;
-            case 2 -> y = minY;
-            case 3 -> y = maxY;
-            case 4 -> z = minZ;
-            default -> z = maxZ;
+            case 0 -> x = box.minX;
+            case 1 -> x = box.maxX;
+            case 2 -> y = box.minY;
+            case 3 -> y = box.maxY;
+            case 4 -> z = box.minZ;
+            default -> z = box.maxZ;
         }
-
         return new Vec3(x, y, z);
     }
 
-    private static double sweptHitTime(Vec3 previousPoint, Vec3 point, BlockPos block) {
-        double result = sweptHit(previousPoint, point, block, false);
+    private static double sweptHitTime(Vec3 prevPoint, Vec3 point, AABB box) {
+        double result = sweptHit(prevPoint, point, box, false);
         return Double.isNaN(result) ? Double.MAX_VALUE : result;
     }
 
-    private static int entryFace(Vec3 previousPoint, Vec3 point, BlockPos block) {
-        double result = sweptHit(previousPoint, point, block, true);
+    private static int entryFace(Vec3 prevPoint, Vec3 point, AABB box) {
+        double result = sweptHit(prevPoint, point, box, true);
         if (!Double.isNaN(result) && result >= 0) return (int) result;
-
-        Vec3 movement = point.subtract(previousPoint);
-        double ax = Math.abs(movement.x);
-        double ay = Math.abs(movement.y);
-        double az = Math.abs(movement.z);
-        if (ax < 1.0E-7 && ay < 1.0E-7 && az < 1.0E-7) return -1;
-        if (ax >= ay && ax >= az) return movement.x >= 0 ? 0 : 1;
-        if (ay >= ax && ay >= az) return movement.y >= 0 ? 2 : 3;
-        return movement.z >= 0 ? 4 : 5;
+        Vec3   m  = point.subtract(prevPoint);
+        double ax = Math.abs(m.x), ay = Math.abs(m.y), az = Math.abs(m.z);
+        if (ax < 1e-7 && ay < 1e-7 && az < 1e-7) return -1;
+        if (ax >= ay && ax >= az) return m.x >= 0 ? 0 : 1;
+        if (ay >= ax && ay >= az) return m.y >= 0 ? 2 : 3;
+        return m.z >= 0 ? 4 : 5;
     }
 
-    private static double sweptHit(Vec3 previousPoint, Vec3 point, BlockPos block, boolean returnFace) {
-        double minX = block.getX();
-        double minY = block.getY();
-        double minZ = block.getZ();
-        double maxX = minX + 1.0;
-        double maxY = minY + 1.0;
-        double maxZ = minZ + 1.0;
-
-        Vec3 delta = point.subtract(previousPoint);
-        double tMin = 0.0;
-        double tMax = 1.0;
+    private static double sweptHit(Vec3 prev, Vec3 point, AABB box, boolean returnFace) {
+        Vec3 delta = point.subtract(prev);
+        double tMin = 0.0, tMax = 1.0;
         int face = -1;
-
-        double[] previous = { previousPoint.x, previousPoint.y, previousPoint.z };
-        double[] motion = { delta.x, delta.y, delta.z };
-        double[] mins = { minX, minY, minZ };
-        double[] maxs = { maxX, maxY, maxZ };
-        int[] minFaces = { 0, 2, 4 };
-        int[] maxFaces = { 1, 3, 5 };
-
+        double[] p = { prev.x, prev.y, prev.z };
+        double[] d = { delta.x, delta.y, delta.z };
+        double[] lo = { box.minX, box.minY, box.minZ };
+        double[] hi = { box.maxX, box.maxY, box.maxZ };
+        int[] loF = { 0, 2, 4 }, hiF = { 1, 3, 5 };
         for (int i = 0; i < 3; i++) {
-            double d = motion[i];
-            if (Math.abs(d) < 1.0E-7) {
-                if (previous[i] < mins[i] || previous[i] > maxs[i]) return Double.NaN;
+            if (Math.abs(d[i]) < 1e-7) {
+                if (p[i] < lo[i] || p[i] > hi[i]) return Double.NaN;
                 continue;
             }
-
-            double t1 = (mins[i] - previous[i]) / d;
-            double t2 = (maxs[i] - previous[i]) / d;
-            int enterFace = d > 0 ? minFaces[i] : maxFaces[i];
-
-            if (t1 > t2) {
-                double tmp = t1;
-                t1 = t2;
-                t2 = tmp;
-            }
-
-            if (t1 > tMin) {
-                tMin = t1;
-                face = enterFace;
-            }
+            double t1 = (lo[i] - p[i]) / d[i];
+            double t2 = (hi[i] - p[i]) / d[i];
+            int ef = d[i] > 0 ? loF[i] : hiF[i];
+            if (t1 > t2) { double tmp = t1; t1 = t2; t2 = tmp; }
+            if (t1 > tMin) { tMin = t1; face = ef; }
             tMax = Math.min(tMax, t2);
             if (tMin > tMax) return Double.NaN;
         }
-
         if (tMax < 0.0 || tMin > 1.0) return Double.NaN;
         return returnFace ? face : Math.max(0.0, tMin);
     }
 
-    private static int nearestFace(Vec3 point, BlockPos block) {
-        double minX = block.getX();
-        double minY = block.getY();
-        double minZ = block.getZ();
-        double maxX = minX + 1.0;
-        double maxY = minY + 1.0;
-        double maxZ = minZ + 1.0;
-
-        double dxMin = Math.abs(point.x - minX);
-        double dxMax = Math.abs(point.x - maxX);
-        double dyMin = Math.abs(point.y - minY);
-        double dyMax = Math.abs(point.y - maxY);
-        double dzMin = Math.abs(point.z - minZ);
-        double dzMax = Math.abs(point.z - maxZ);
-        double nearest = Math.min(Math.min(Math.min(dxMin, dxMax), Math.min(dyMin, dyMax)), Math.min(dzMin, dzMax));
-
-        if (nearest == dxMin) return 0;
-        if (nearest == dxMax) return 1;
-        if (nearest == dyMin) return 2;
-        if (nearest == dyMax) return 3;
-        if (nearest == dzMin) return 4;
-        return 5;
+    private static int nearestFace(Vec3 point, AABB box) {
+        double dxMin = Math.abs(point.x - box.minX), dxMax = Math.abs(point.x - box.maxX);
+        double dyMin = Math.abs(point.y - box.minY), dyMax = Math.abs(point.y - box.maxY);
+        double dzMin = Math.abs(point.z - box.minZ), dzMax = Math.abs(point.z - box.maxZ);
+        double n = Math.min(Math.min(Math.min(dxMin, dxMax), Math.min(dyMin, dyMax)), Math.min(dzMin, dzMax));
+        if (n == dxMin) return 0; if (n == dxMax) return 1;
+        if (n == dyMin) return 2; if (n == dyMax) return 3;
+        if (n == dzMin) return 4; return 5;
     }
 
-    private static double clamp(double value, double min, double max) {
-        return Math.max(min, Math.min(max, value));
+    private static double clamp(double v, double lo, double hi) {
+        return Math.max(lo, Math.min(hi, v));
     }
 
+    // Reads a block state for the given PLOT-LOCAL block position.
+    //
+    // Coordinate notes:
+    //   plot-local → + center → backing frame (large XZ, e.g. ±20M)
+    //   LevelPlot.getChunk() takes LOCAL chunk pos (via toLocal conversion)
+    //   LevelChunk.getBlockState() uses BACKING block coordinates for its
+    //   within-chunk index (backingBlock.x & 15 etc.), because the chunk data
+    //   was originally populated from the backing level.
+    private static BlockState plotBlockState(Object plot, BlockPos center, BlockPos plotLocalBlock) throws Exception {
+        BlockPos  backingBlock    = plotLocalBlock.offset(center);
+        ChunkPos  backingChunkPos = new ChunkPos(backingBlock);
+        ChunkPos  localChunkPos   = mPlotToLocalChunk != null
+            ? (ChunkPos) mPlotToLocalChunk.invoke(plot, backingChunkPos)
+            : backingChunkPos;
+        LevelChunk chunk = (LevelChunk) mGetPlotChunk.invoke(plot, localChunkPos);
+        return chunk != null ? chunk.getBlockState(backingBlock) : Blocks.AIR.defaultBlockState();
+    }
+
+    // Returns the plot center as a Vec3 (backing-level block coords of local origin).
+    private static Vec3 plotCenter(Object plot) throws Exception {
+        BlockPos c = (BlockPos) mGetPlotCenter.invoke(plot);
+        return new Vec3(c.getX(), c.getY(), c.getZ());
+    }
+
+    // ── Coordinate conversions ────────────────────────────────────────────────
+
+    /**
+     * Converts a plot-local anchor back to visible-world position.
+     * plotLocal → backingPos (add center) → visibleWorld (transformPosition).
+     */
     @Nullable
-    private static Hit findHelperAttachment(Level level, Vec3 previousHookPos, Vec3 hookPos) throws Exception {
-        if (sableHelper == null || mRunIncludingSubLevels == null) return null;
-
-        double length = hookPos.distanceTo(previousHookPos);
-        int steps = Math.max(1, Math.min(12, (int) Math.ceil(length / 0.35)));
-
-        for (int step = 0; step <= steps; step++) {
-            double t = (double) step / (double) steps;
-            Vec3 centerSample = previousHookPos.lerp(hookPos, t);
-
-            for (Vec3 offset : HELPER_SAMPLE_OFFSETS) {
-                final Vec3 sample = centerSample.add(offset);
-                BiFunction<Object, BlockPos, Object> callback = (access, block) -> {
-                    if (access == null || isRemoved(access)) return null;
-
-                    try {
-                        Object pose = mLogicalPose.invoke(access);
-                        Vec3 localPrevious = (Vec3) mTransformInverse.invoke(pose, previousHookPos);
-                        Vec3 localSample = (Vec3) mTransformInverse.invoke(pose, sample);
-                        Vec3 attach = findLocalAttachmentNear(access, localPrevious, localSample, block, 1);
-                        return attach == null ? null : new Hit(access, attach);
-                    } catch (Exception e) {
-                        return null;
-                    }
-                };
-
-                Object result = mRunIncludingSubLevels.invoke(sableHelper, level, sample, false, null, callback);
-                if (result instanceof Hit hit) {
-                    CCCC.LOGGER.debug("[cccc] Sable helper fallback hit at local {}", hit.localAttach());
-                    return hit;
-                }
-            }
-        }
-
-        return null;
-    }
-
-    @Nullable
-    private static Vec3 findLocalAttachmentNear(
-        Object subLevel,
-        Vec3 localPreviousPos,
-        Vec3 localPos,
-        BlockPos centerBlock,
-        int radius
-    ) {
-        AABB localAabb = new AABB(
-            centerBlock.getX() - radius,
-            centerBlock.getY() - radius,
-            centerBlock.getZ() - radius,
-            centerBlock.getX() + radius + 1.0,
-            centerBlock.getY() + radius + 1.0,
-            centerBlock.getZ() + radius + 1.0
-        );
-        return findLocalAttachment(subLevel, localPreviousPos, localPos, localAabb, 9.0);
-    }
-
-    private static BlockState plotBlockState(Object plot, BlockPos localBlock) throws Exception {
-        BlockState backingFrameState = plotBlockStateForBackingBlock(plot, localBlock);
-        if (!backingFrameState.isAir()) return backingFrameState;
-
-        BlockPos center = (BlockPos) mGetPlotCenterBlock.invoke(plot);
-        BlockPos backingBlock = localBlock.offset(center);
-        BlockState centeredFrameState = plotBlockStateForBackingBlock(plot, backingBlock);
-        if (!centeredFrameState.isAir()) return centeredFrameState;
-
-        LevelChunk localChunk = (LevelChunk) mGetPlotChunk.invoke(plot, new ChunkPos(localBlock));
-        if (localChunk != null) {
-            BlockState localFrameState = localChunk.getBlockState(localBlock);
-            if (!localFrameState.isAir()) return localFrameState;
-        }
-
-        return net.minecraft.world.level.block.Blocks.AIR.defaultBlockState();
-    }
-
-    private static BlockState plotBlockStateForBackingBlock(Object plot, BlockPos backingBlock) throws Exception {
-        ChunkPos localChunk = (ChunkPos) mPlotToLocalChunk.invoke(plot, new ChunkPos(backingBlock));
-        LevelChunk chunk = (LevelChunk) mGetPlotChunk.invoke(plot, localChunk);
-        return chunk == null
-            ? net.minecraft.world.level.block.Blocks.AIR.defaultBlockState()
-            : chunk.getBlockState(backingBlock);
-    }
-
-    private static Set<Object> queryBroadHits(Object container, AABB worldAabb) throws Exception {
-        if (ctorBB3d == null || mQueryIntersecting == null) return Collections.emptySet();
-
-        Object queryBox = ctorBB3d.newInstance(
-            worldAabb.minX, worldAabb.minY, worldAabb.minZ,
-            worldAabb.maxX, worldAabb.maxY, worldAabb.maxZ
-        );
-        Iterable<?> hits = (Iterable<?>) mQueryIntersecting.invoke(container, queryBox);
-        Set<Object> result = Collections.newSetFromMap(new IdentityHashMap<>());
-        for (Object hit : hits) {
-            result.add(hit);
-        }
-        return result;
-    }
-
-    private static boolean plotContains(Object plot, BlockPos localBlock) throws Exception {
-        if (mGetPlotBounds == null || mBoundsContains == null) return false;
-        Object bounds = mGetPlotBounds.invoke(plot);
-        return (boolean) mBoundsContains.invoke(
-            bounds,
-            localBlock.getX(),
-            localBlock.getY(),
-            localBlock.getZ()
-        );
-    }
-
-    /** Convert a sub-level-local position back to world space (called each tick). */
-    @Nullable
-    public static Vec3 toWorldPos(Object subLevel, Vec3 localPos) {
+    public static Vec3 toWorldPos(Object subLevel, Vec3 plotLocalPos) {
         if (!isAvailable() || subLevel == null) return null;
         try {
-            Object pose = mLogicalPose.invoke(subLevel);
-            return (Vec3) mTransformPosition.invoke(pose, localPos);
+            Object pose   = mLogicalPose.invoke(subLevel);
+            Object plot   = mGetPlot.invoke(subLevel);
+            Vec3   center = plotCenter(plot);
+            Vec3   backing = plotLocalPos.add(center);
+            return (Vec3) mTransformPosition.invoke(pose, backing);
         } catch (Exception e) {
             return null;
         }
     }
 
-    /** Convert a sub-level-local position through the client render pose when available. */
+    /**
+     * Same as {@link #toWorldPos} but uses the client render pose for smooth interpolation.
+     */
     @Nullable
-    public static Vec3 toRenderWorldPos(Object subLevel, Vec3 localPos, float partialTicks) {
+    public static Vec3 toRenderWorldPos(Object subLevel, Vec3 plotLocalPos, float partialTicks) {
         if (!isAvailable() || subLevel == null) return null;
         try {
-            Object pose = mRenderPose == null ? mLogicalPose.invoke(subLevel) : mRenderPose.invoke(subLevel, partialTicks);
-            return (Vec3) mTransformPosition.invoke(pose, localPos);
+            Object plot   = mGetPlot.invoke(subLevel);
+            Vec3   center = plotCenter(plot);
+            Vec3   backing = plotLocalPos.add(center);
+            Object pose = mRenderPose == null
+                ? mLogicalPose.invoke(subLevel)
+                : mRenderPose.invoke(subLevel, partialTicks);
+            return (Vec3) mTransformPosition.invoke(pose, backing);
         } catch (Exception e) {
-            return toWorldPos(subLevel, localPos);
+            return toWorldPos(subLevel, plotLocalPos);
         }
     }
 
-    /** Convert a world position to sub-level-local space (stored as attach point). */
+    /**
+     * Converts a visible-world position to plot-local space (stored as anchor).
+     * visibleWorld → backingPos (transformPositionInverse) → plotLocal (subtract center).
+     */
     @Nullable
     public static Vec3 toLocalPos(Object subLevel, Vec3 worldPos) {
         if (!isAvailable() || subLevel == null) return null;
         try {
-            Object pose = mLogicalPose.invoke(subLevel);
-            return (Vec3) mTransformInverse.invoke(pose, worldPos);
+            Object pose   = mLogicalPose.invoke(subLevel);
+            Object plot   = mGetPlot.invoke(subLevel);
+            Vec3   center = plotCenter(plot);
+            Vec3   backing = (Vec3) mTransformInverse.invoke(pose, worldPos);
+            return backing.subtract(center);
         } catch (Exception e) {
             return null;
         }
     }
 
-    /** Returns true if the sub-level has been removed / disassembled. */
     public static boolean isRemoved(Object subLevel) {
         if (!isAvailable() || subLevel == null) return true;
         try {
@@ -546,37 +457,9 @@ public final class SableCompat {
             }
 
             Class<?> plotCls = Class.forName("dev.ryanhcode.sable.sublevel.plot.LevelPlot");
-            mGetPlotChunk = plotCls.getMethod("getChunk", ChunkPos.class);
-            mGetPlotCenterBlock = plotCls.getMethod("getCenterBlock");
-            mPlotToLocalChunk = plotCls.getMethod("toLocal", ChunkPos.class);
-            mGetPlotBounds = plotCls.getMethod("getBoundingBox");
-
-            // Companion classes live in the JarInJar; accessible at runtime via NeoForge
-            // JarInJar extraction but not at Gradle compile time.
-            try {
-                clsBB3dc = Class.forName("dev.ryanhcode.sable.companion.math.BoundingBox3dc");
-                Class<?> subLevelAccessCls = Class.forName("dev.ryanhcode.sable.companion.SubLevelAccess");
-                Class<?> bb3iCls = Class.forName("dev.ryanhcode.sable.companion.math.BoundingBox3ic");
-                mBoundsContains = bb3iCls.getMethod("contains", int.class, int.class, int.class);
-                Class<?> bb3dCls = Class.forName("dev.ryanhcode.sable.companion.math.BoundingBox3d");
-                ctorBB3d         = bb3dCls.getConstructor(
-                    double.class, double.class, double.class, double.class, double.class, double.class);
-                mQueryIntersecting = containerCls.getMethod("queryIntersecting", clsBB3dc);
-
-                Class<?> sableCls = Class.forName("dev.ryanhcode.sable.Sable");
-                sableHelper = sableCls.getField("HELPER").get(null);
-                Class<?> helperCls = Class.forName("dev.ryanhcode.sable.ActiveSableCompanion");
-                mRunIncludingSubLevels = helperCls.getMethod(
-                    "runIncludingSubLevels",
-                    Level.class,
-                    Vec3.class,
-                    boolean.class,
-                    subLevelAccessCls,
-                    BiFunction.class
-                );
-            } catch (ClassNotFoundException ignored) {
-                CCCC.LOGGER.debug("[cccc] Sable companion not yet extracted; using getAllSubLevels fallback");
-            }
+            mGetPlotChunk      = plotCls.getMethod("getChunk", ChunkPos.class);
+            mGetPlotCenter     = plotCls.getMethod("getCenterBlock");
+            mPlotToLocalChunk  = plotCls.getMethod("toLocal", ChunkPos.class);
 
             Class<?> poseCls = Class.forName("dev.ryanhcode.sable.companion.math.Pose3dc");
             mTransformPosition = poseCls.getMethod("transformPosition", Vec3.class);

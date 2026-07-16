@@ -1,12 +1,14 @@
 package cc.spea.cccc.compat;
 
-import com.github.eterdelta.crittersandcompanions.entity.GrapplingHookEntity;
-import com.github.eterdelta.crittersandcompanions.platform.Services;
+import cc.spea.cccc.CCCC;
+import io.github.bonsaistudi0s.crittersandcompanions.common.entity.GrapplingHookEntity;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.phys.Vec3;
 import net.neoforged.neoforge.event.tick.PlayerTickEvent;
 
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -22,6 +24,7 @@ import java.util.concurrent.ConcurrentHashMap;
 public final class SableGrappleHandler {
 
     private static final Map<UUID, Attachment> ACTIVE = new ConcurrentHashMap<>();
+    private static final GrapplingConfig CONFIG = new GrapplingConfig();
 
     private SableGrappleHandler() {}
 
@@ -63,7 +66,7 @@ public final class SableGrappleHandler {
         }
 
         double distanceSqr = player.position().distanceToSqr(target);
-        double maxDistance = Services.CONFIGS.common().grapplingHookMaxDistance.get();
+        double maxDistance = CONFIG.maxDistance();
         if (distanceSqr > maxDistance * maxDistance) {
             ACTIVE.remove(player.getUUID());
             return;
@@ -71,7 +74,7 @@ public final class SableGrappleHandler {
 
         if (distanceSqr > attachment.stickLengthSqr) {
             Vec3 direction = target.subtract(player.position()).normalize();
-            double maxSpeed = Services.CONFIGS.common().grapplingHookMaxSpeed.get();
+            double maxSpeed = CONFIG.maxSpeed();
             double speed = Math.min(maxSpeed, 0.01 * Math.sqrt(distanceSqr));
             if (speed >= 0.0) {
                 player.setDeltaMovement(player.getDeltaMovement().add(direction.scale(speed)));
@@ -91,4 +94,61 @@ public final class SableGrappleHandler {
         double stickLengthSqr,
         ItemStack focusStack
     ) {}
+
+    private static final class GrapplingConfig {
+        private static final double DEFAULT_MAX_DISTANCE = 16.0D;
+        private static final double DEFAULT_MAX_SPEED = 1.5D;
+        private static final String CONFIG_CLASS = "io.github.bonsaistudi0s.crittersandcompanions.common.config.CACCommonConfig";
+
+        private boolean initialized;
+        private boolean available;
+        private Object handler;
+        private Method instanceMethod;
+        private Field grapplingHookField;
+        private Field maxDistanceField;
+        private Field maxSpeedField;
+
+        double maxDistance() {
+            return readDouble(maxDistanceField, DEFAULT_MAX_DISTANCE);
+        }
+
+        double maxSpeed() {
+            return readDouble(maxSpeedField, DEFAULT_MAX_SPEED);
+        }
+
+        private double readDouble(Field field, double fallback) {
+            ensureInit();
+            if (!available || field == null) return fallback;
+
+            try {
+                Object config = instanceMethod.invoke(handler);
+                Object grapplingHook = grapplingHookField.get(config);
+                return field.getDouble(grapplingHook);
+            } catch (Exception e) {
+                CCCC.LOGGER.debug("[cccc] Failed to read C&C grappling config: {}", e.toString());
+                available = false;
+                return fallback;
+            }
+        }
+
+        private void ensureInit() {
+            if (initialized) return;
+            initialized = true;
+
+            try {
+                Class<?> configClass = Class.forName(CONFIG_CLASS);
+                Field handlerField = configClass.getField("HANDLER");
+                handler = handlerField.get(null);
+                instanceMethod = handler.getClass().getMethod("instance");
+                grapplingHookField = configClass.getField("grapplingHook");
+
+                Class<?> grapplingHookClass = grapplingHookField.getType();
+                maxDistanceField = grapplingHookClass.getField("grapplingHookMaxDistance");
+                maxSpeedField = grapplingHookClass.getField("grapplingHookMaxSpeed");
+                available = true;
+            } catch (Exception e) {
+                CCCC.LOGGER.debug("[cccc] Failed to initialize C&C grappling config reflection: {}", e.toString());
+            }
+        }
+    }
 }

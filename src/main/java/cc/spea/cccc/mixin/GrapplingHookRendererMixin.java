@@ -1,8 +1,8 @@
 package cc.spea.cccc.mixin;
 
 import cc.spea.cccc.compat.CreateHookRenderAttachment;
-import com.github.eterdelta.crittersandcompanions.client.renderer.GrapplingHookRenderer;
-import com.github.eterdelta.crittersandcompanions.entity.GrapplingHookEntity;
+import io.github.bonsaistudi0s.crittersandcompanions.client.renderer.GrapplingHookRenderer;
+import io.github.bonsaistudi0s.crittersandcompanions.common.entity.GrapplingHookEntity;
 import com.mojang.blaze3d.vertex.PoseStack;
 import net.minecraft.client.renderer.MultiBufferSource;
 import net.minecraft.util.Mth;
@@ -20,7 +20,7 @@ public abstract class GrapplingHookRendererMixin {
     @Unique private Vec3 cccc_renderCreateHookPos;
 
     @Inject(
-        method = "render(Lcom/github/eterdelta/crittersandcompanions/entity/GrapplingHookEntity;FFLcom/mojang/blaze3d/vertex/PoseStack;Lnet/minecraft/client/renderer/MultiBufferSource;I)V",
+        method = "render(Lio/github/bonsaistudi0s/crittersandcompanions/common/entity/GrapplingHookEntity;FFLcom/mojang/blaze3d/vertex/PoseStack;Lnet/minecraft/client/renderer/MultiBufferSource;I)V",
         at = @At(
             value = "INVOKE",
             target = "Lcom/mojang/blaze3d/vertex/PoseStack;pushPose()V",
@@ -51,7 +51,7 @@ public abstract class GrapplingHookRendererMixin {
     }
 
     @Inject(
-        method = "render(Lcom/github/eterdelta/crittersandcompanions/entity/GrapplingHookEntity;FFLcom/mojang/blaze3d/vertex/PoseStack;Lnet/minecraft/client/renderer/MultiBufferSource;I)V",
+        method = "render(Lio/github/bonsaistudi0s/crittersandcompanions/common/entity/GrapplingHookEntity;FFLcom/mojang/blaze3d/vertex/PoseStack;Lnet/minecraft/client/renderer/MultiBufferSource;I)V",
         at = @At("RETURN")
     )
     private void cccc_clearCreatePartialPosition(
@@ -67,7 +67,7 @@ public abstract class GrapplingHookRendererMixin {
     }
 
     @Redirect(
-        method = "render(Lcom/github/eterdelta/crittersandcompanions/entity/GrapplingHookEntity;FFLcom/mojang/blaze3d/vertex/PoseStack;Lnet/minecraft/client/renderer/MultiBufferSource;I)V",
+        method = "render(Lio/github/bonsaistudi0s/crittersandcompanions/common/entity/GrapplingHookEntity;FFLcom/mojang/blaze3d/vertex/PoseStack;Lnet/minecraft/client/renderer/MultiBufferSource;I)V",
         at = @At(value = "INVOKE", target = "Lnet/minecraft/util/Mth;lerp(DDD)D", ordinal = 5)
     )
     private double cccc_renderHookStringX(double delta, double start, double end) {
@@ -75,7 +75,7 @@ public abstract class GrapplingHookRendererMixin {
     }
 
     @Redirect(
-        method = "render(Lcom/github/eterdelta/crittersandcompanions/entity/GrapplingHookEntity;FFLcom/mojang/blaze3d/vertex/PoseStack;Lnet/minecraft/client/renderer/MultiBufferSource;I)V",
+        method = "render(Lio/github/bonsaistudi0s/crittersandcompanions/common/entity/GrapplingHookEntity;FFLcom/mojang/blaze3d/vertex/PoseStack;Lnet/minecraft/client/renderer/MultiBufferSource;I)V",
         at = @At(value = "INVOKE", target = "Lnet/minecraft/util/Mth;lerp(DDD)D", ordinal = 6)
     )
     private double cccc_renderHookStringY(double delta, double start, double end) {
@@ -83,7 +83,7 @@ public abstract class GrapplingHookRendererMixin {
     }
 
     @Redirect(
-        method = "render(Lcom/github/eterdelta/crittersandcompanions/entity/GrapplingHookEntity;FFLcom/mojang/blaze3d/vertex/PoseStack;Lnet/minecraft/client/renderer/MultiBufferSource;I)V",
+        method = "render(Lio/github/bonsaistudi0s/crittersandcompanions/common/entity/GrapplingHookEntity;FFLcom/mojang/blaze3d/vertex/PoseStack;Lnet/minecraft/client/renderer/MultiBufferSource;I)V",
         at = @At(value = "INVOKE", target = "Lnet/minecraft/util/Mth;lerp(DDD)D", ordinal = 7)
     )
     private double cccc_renderHookStringZ(double delta, double start, double end) {

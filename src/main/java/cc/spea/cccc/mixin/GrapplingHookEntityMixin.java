@@ -4,8 +4,7 @@ import cc.spea.cccc.CCCC;
 import cc.spea.cccc.compat.CreateHookRenderAttachment;
 import cc.spea.cccc.compat.SableCompat;
 import cc.spea.cccc.compat.SableGrappleHandler;
-import com.github.eterdelta.crittersandcompanions.entity.GrapplingHookEntity;
-import com.github.eterdelta.crittersandcompanions.platform.Services;
+import io.github.bonsaistudi0s.crittersandcompanions.common.entity.GrapplingHookEntity;
 import com.simibubi.create.content.contraptions.AbstractContraptionEntity;
 import net.minecraft.core.BlockPos;
 import net.minecraft.util.Mth;
@@ -28,6 +27,7 @@ import org.spongepowered.asm.mixin.injection.Redirect;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 import javax.annotation.Nullable;
+import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -66,6 +66,7 @@ import java.util.List;
  */
 @Mixin(GrapplingHookEntity.class)
 public abstract class GrapplingHookEntityMixin extends ThrowableItemProjectile implements CreateHookRenderAttachment {
+    @Unique private static final CcccGrapplingConfig CCCC_CONFIG = new CcccGrapplingConfig();
 
     // ── Shadowed C&C field ───────────────────────────────────────────────────
     // Verified: javap -classpath critters-and-companions-*.jar -p
@@ -107,6 +108,29 @@ public abstract class GrapplingHookEntityMixin extends ThrowableItemProjectile i
             ci.cancel();
             return;
         }
+
+        // Sable's physics blocks register in the real-world collision system, so
+        // C&C's own isStick fires on contact.  If the hook is stuck against
+        // something AND a Sable sub-level is within 32 blocks, anchor there using
+        // the hook's current world position directly — no block-data reads needed.
+        if (!this.level().isClientSide && cccc_contraption == null) {
+            if (this.isStick) {
+                SableCompat.Hit hit = SableCompat.findSubLevelNear(this.level(), this.position());
+                CCCC.LOGGER.debug("[cccc] Hook #{} isStick=true at {} | findSubLevelNear={}",
+                    getId(), this.position(), hit == null ? "null" : "dist=" + hit.localAttach().length());
+                if (hit != null && !cccc_shouldIgnoreOwnerFootSableHit(hit) && cccc_startSableFallback(hit)) {
+                    ci.cancel();
+                    return;
+                }
+            } else if (SableCompat.isAvailable()) {
+                // Log every few ticks while flying so we can see isStick is never true
+                if (this.tickCount % 10 == 0) {
+                    CCCC.LOGGER.debug("[cccc] Hook #{} tick={} isStick=false pos={} vel={}",
+                        getId(), this.tickCount, this.position(), this.getDeltaMovement());
+                }
+            }
+        }
+
         cccc_pinToAttach();
     }
 
@@ -171,6 +195,33 @@ public abstract class GrapplingHookEntityMixin extends ThrowableItemProjectile i
             }
         }
 
+        // Materialize the iterable — getBlockCollisions returns a one-shot Stream,
+        // so calling iterator() more than once throws.  We need to peek AND return.
+        if (!level.isClientSide && SableCompat.isAvailable()) {
+            List<VoxelShape> realList = new ArrayList<>();
+            for (VoxelShape s : real) realList.add(s);
+
+            CCCC.LOGGER.debug("[cccc] Hook #{} redirect: hasRealCollision={} pos={} prev={}",
+                getId(), !realList.isEmpty(), hookPos, previousHookPos);
+
+            // Real-world collision fired — the hook physically touched the Sable
+            // structure.  Start the fallback immediately so the hook doesn't bounce
+            // away before the next tick HEAD.  Use previousHookPos (position before
+            // super.tick() moved the hook) so the anchor lands at the surface rather
+            // than past it.
+            if (!realList.isEmpty() && cccc_contraption == null && cccc_sableSubLevel == null) {
+                SableCompat.Hit sableHit = SableCompat.findSubLevelNear(level, previousHookPos);
+                if (sableHit != null && !cccc_shouldIgnoreOwnerFootSableHit(sableHit)) {
+                    CCCC.LOGGER.debug("[cccc] Hook #{} → Sable via real-collision proximity", getId());
+                    if (cccc_startSableFallback(sableHit)) {
+                        return cccc_fakeSolid();
+                    }
+                }
+            }
+
+            return realList::iterator;
+        }
+
         return real;
     }
 
@@ -182,8 +233,8 @@ public abstract class GrapplingHookEntityMixin extends ThrowableItemProjectile i
             Vec3 target = cccc_sableLocalAttach == null ? null : SableCompat.toWorldPos(cccc_sableSubLevel, cccc_sableLocalAttach);
             if (target != null) {
                 Vec3 direction = target.subtract(player.position()).normalize();
-                double reelSpeed = Services.CONFIGS.common().grapplingHookSpeed.get() / 4.0;
-                double maxSpeed = Services.CONFIGS.common().grapplingHookMaxSpeed.get();
+                double reelSpeed = CCCC_CONFIG.speed() / 4.0;
+                double maxSpeed = CCCC_CONFIG.maxSpeed();
                 double speed = Math.min(maxSpeed, reelSpeed * Math.sqrt(player.position().distanceToSqr(target)));
                 player.setDeltaMovement(direction.scale(speed));
                 player.hurtMarked = true;
@@ -584,5 +635,63 @@ public abstract class GrapplingHookEntityMixin extends ThrowableItemProjectile i
     @Unique
     private static double cccc_clamp(double value, double min, double max) {
         return Math.max(min, Math.min(max, value));
+    }
+
+    @Unique
+    private static final class CcccGrapplingConfig {
+        private static final double DEFAULT_SPEED = 2.0D;
+        private static final double DEFAULT_MAX_SPEED = 1.5D;
+        private static final String CONFIG_CLASS = "io.github.bonsaistudi0s.crittersandcompanions.common.config.CACCommonConfig";
+
+        private boolean initialized;
+        private boolean available;
+        private Object handler;
+        private java.lang.reflect.Method instanceMethod;
+        private java.lang.reflect.Field grapplingHookField;
+        private java.lang.reflect.Field speedField;
+        private java.lang.reflect.Field maxSpeedField;
+
+        double speed() {
+            return cccc_readDouble(speedField, DEFAULT_SPEED);
+        }
+
+        double maxSpeed() {
+            return cccc_readDouble(maxSpeedField, DEFAULT_MAX_SPEED);
+        }
+
+        private double cccc_readDouble(@Nullable java.lang.reflect.Field field, double fallback) {
+            cccc_ensureInit();
+            if (!available || field == null) return fallback;
+
+            try {
+                Object config = instanceMethod.invoke(handler);
+                Object grapplingHook = grapplingHookField.get(config);
+                return field.getDouble(grapplingHook);
+            } catch (Exception e) {
+                CCCC.LOGGER.debug("[cccc] Failed to read C&C grappling config: {}", e.toString());
+                available = false;
+                return fallback;
+            }
+        }
+
+        private void cccc_ensureInit() {
+            if (initialized) return;
+            initialized = true;
+
+            try {
+                Class<?> configClass = Class.forName(CONFIG_CLASS);
+                java.lang.reflect.Field handlerField = configClass.getField("HANDLER");
+                handler = handlerField.get(null);
+                instanceMethod = handler.getClass().getMethod("instance");
+                grapplingHookField = configClass.getField("grapplingHook");
+
+                Class<?> grapplingHookClass = grapplingHookField.getType();
+                speedField = grapplingHookClass.getField("grapplingHookSpeed");
+                maxSpeedField = grapplingHookClass.getField("grapplingHookMaxSpeed");
+                available = true;
+            } catch (Exception e) {
+                CCCC.LOGGER.debug("[cccc] Failed to initialize C&C grappling config reflection: {}", e.toString());
+            }
+        }
     }
 }
